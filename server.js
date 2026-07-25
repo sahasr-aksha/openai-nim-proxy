@@ -117,7 +117,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     
     // Default High Max Tokens (Default 131,072 for high context support, unless client explicitly requests lower/higher)
     const MAX_ALLOWED_TOKENS = 131072; // 128k tokens
-    const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : 131072;
+    const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : 1000000;
 
     // Determine reasoning config for this request.
     // Priority: client's own top-level chat_template_kwargs > legacy extra_body.chat_template_kwargs
