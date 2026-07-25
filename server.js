@@ -15,7 +15,7 @@ const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.c
 const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output with <think> tags
-const SHOW_REASONING = false; 
+const SHOW_REASONING = true; // TEMP: debugging whether reasoning_content is actually returned
 
 // 🔥 DEFAULT THINKING MODE TOGGLE (if not provided by client)
 const ENABLE_THINKING_MODE = false; 
@@ -116,7 +116,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     let nimModel = MODEL_MAPPING[model] || model;
     
     // Default High Max Tokens (Default 131,072 for high context support, unless client explicitly requests lower/higher)
-    const MAX_ALLOWED_TOKENS = 1000000; // 128k tokens
+    const MAX_ALLOWED_TOKENS = 131072; // 128k tokens
     const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : 131072;
 
     // Determine reasoning config for this request.
