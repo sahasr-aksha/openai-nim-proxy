@@ -96,8 +96,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       top_p, 
       max_tokens, 
       stream, 
-      extra_body,
-      seed
+      extra_body,       // legacy/back-compat: some SDKs nest reasoning config here
+      chat_template_kwargs, // NIM's actual native field — sent directly by well-behaved clients
+      seed,
+      ...rest           // pass through anything else the client sends (tools, response_format, etc.)
     } = req.body;
 
     if (!NIM_API_KEY) {
@@ -114,18 +116,26 @@ app.post('/v1/chat/completions', async (req, res) => {
     let nimModel = MODEL_MAPPING[model] || model;
     
     // Default High Max Tokens (Default 131,072 for high context support, unless client explicitly requests lower/higher)
-    const MAX_ALLOWED_TOKENS = 131072; // 128k tokens
+    const MAX_ALLOWED_TOKENS = 1000000; // 128k tokens
     const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : 131072;
 
-    // Handle extra_body for thinking parameters
-    // Priority: client-supplied extra_body > per-model max-reasoning default > global toggle
-    const finalExtraBody =
-      extra_body ||
-      MAX_REASONING_BY_MODEL[nimModel] ||
-      (ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined);
+    // Determine reasoning config for this request.
+    // Priority: client's own top-level chat_template_kwargs > legacy extra_body.chat_template_kwargs
+    //           > per-model max-reasoning default > global ENABLE_THINKING_MODE toggle.
+    // IMPORTANT: NIM's real API takes chat_template_kwargs at the TOP LEVEL of the request body.
+    // "extra_body" is only a client-SDK-side convention (OpenAI/Together SDKs flatten it before
+    // sending); NIM itself rejects a literal "extra_body" field with a 400 Validation error.
+    const finalChatTemplateKwargs =
+      chat_template_kwargs ||
+      extra_body?.chat_template_kwargs ||
+      MAX_REASONING_BY_MODEL[nimModel]?.chat_template_kwargs ||
+      (ENABLE_THINKING_MODE ? { thinking: true } : undefined);
 
-    // Transform OpenAI request to NVIDIA NIM format
+    // Transform OpenAI request to NVIDIA NIM format.
+    // Spread ...rest first so any other NIM-supported fields (tools, tool_choice,
+    // response_format, etc.) pass straight through, then set the normalized fields on top.
     const nimRequest = {
+      ...rest,
       model: nimModel,
       messages: messages,
       temperature: temperature !== undefined ? temperature : 0.7,
@@ -139,8 +149,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.seed = seed;
     }
 
-    if (finalExtraBody) {
-      nimRequest.extra_body = finalExtraBody;
+    if (finalChatTemplateKwargs) {
+      nimRequest.chat_template_kwargs = finalChatTemplateKwargs;
     }
 
     // Make request to NVIDIA NIM API
