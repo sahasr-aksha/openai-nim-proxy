@@ -115,9 +115,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model] || model;
     
-    // Default High Max Tokens (Default 131,072 for high context support, unless client explicitly requests lower/higher)
-    const MAX_ALLOWED_TOKENS = 131072; // 128k tokens
-    const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : 1000000;
+    // Default High Max Tokens (raised to 1,000,000 per request — note: this is our own
+    // proxy-side ceiling only. NVIDIA's hosted endpoints enforce their own real output caps
+    // per model (e.g. GLM-5.2 lists 131072 as its actual max output on NIM), so requests
+    // above a model's true limit will still be clamped or rejected upstream regardless of
+    // this value.)
+    const MAX_ALLOWED_TOKENS = 1000000;
+    const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : MAX_ALLOWED_TOKENS;
 
     // Determine reasoning config for this request.
     // Priority: client's own top-level chat_template_kwargs > legacy extra_body.chat_template_kwargs
@@ -186,7 +190,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             try {
               const data = JSON.parse(line.slice(6));
               if (data.choices?.[0]?.delta) {
-                const reasoning = data.choices[0].delta.reasoning_content;
+                const reasoning = data.choices[0].delta.reasoning_content ?? data.choices[0].delta.reasoning;
                 const content = data.choices[0].delta.content;
 
                 if (SHOW_REASONING) {
@@ -209,6 +213,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                   if (combinedContent) {
                     data.choices[0].delta.content = combinedContent;
                     delete data.choices[0].delta.reasoning_content;
+                    delete data.choices[0].delta.reasoning;
                   }
                 } else {
                   if (content) {
@@ -217,6 +222,7 @@ app.post('/v1/chat/completions', async (req, res) => {
                     data.choices[0].delta.content = '';
                   }
                   delete data.choices[0].delta.reasoning_content;
+                  delete data.choices[0].delta.reasoning;
                 }
               }
               res.write(`data: ${JSON.stringify(data)}\n\n`);
@@ -243,8 +249,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         choices: (response.data.choices || []).map(choice => {
           let fullContent = choice.message?.content || '';
 
-          if (SHOW_REASONING && choice.message?.reasoning_content) {
-            fullContent = '<think>\n' + choice.message.reasoning_content + '\n</think>\n\n' + fullContent;
+          const reasoningText = choice.message?.reasoning_content ?? choice.message?.reasoning;
+          if (SHOW_REASONING && reasoningText) {
+            fullContent = '<think>\n' + reasoningText + '\n</think>\n\n' + fullContent;
           }
 
           return {
