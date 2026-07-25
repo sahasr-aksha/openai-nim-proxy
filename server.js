@@ -29,7 +29,8 @@ const MODEL_MAPPING = {
   'gpt-4-turbo': 'moonshotai/kimi-k2-instruct-0905',
   'claude-3-opus': 'meta/llama-3.1-405b-instruct',
   'claude-3-sonnet': 'meta/llama-3.1-70b-instruct',
-  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking' 
+  'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
+  'glm-5.2': 'z-ai/glm-5.2'
 };
 
 // 1. Root Endpoint (Fixes Railway "/" 404 Error)
@@ -82,7 +83,8 @@ app.post('/v1/chat/completions', async (req, res) => {
       top_p, 
       max_tokens, 
       stream, 
-      extra_body 
+      extra_body,
+      seed
     } = req.body;
 
     if (!NIM_API_KEY) {
@@ -114,6 +116,11 @@ app.post('/v1/chat/completions', async (req, res) => {
       max_tokens: selectedMaxTokens,
       stream: stream || false
     };
+
+    // Forward seed for reproducible generations (e.g. seed=42 from client scripts)
+    if (seed !== undefined) {
+      nimRequest.seed = seed;
+    }
 
     if (finalExtraBody) {
       nimRequest.extra_body = finalExtraBody;
