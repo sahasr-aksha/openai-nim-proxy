@@ -30,7 +30,20 @@ const MODEL_MAPPING = {
   'claude-3-opus': 'meta/llama-3.1-405b-instruct',
   'claude-3-sonnet': 'meta/llama-3.1-70b-instruct',
   'gemini-pro': 'qwen/qwen3-next-80b-a3b-thinking',
-  'glm-5.2': 'z-ai/glm-5.2'
+  'glm-5.2': 'z-ai/glm-5.2',
+  'z-ai/glm-5.2': 'z-ai/glm-5.2',
+  'minimax-m3': 'minimaxai/minimax-m3',
+  'minimaxai/minimax-m3': 'minimaxai/minimax-m3'
+};
+
+// 🔥 Per-model "max reasoning" defaults.
+// Each of these models exposes thinking through a different chat_template_kwargs
+// shape on NIM, so they can't share one generic { thinking: true } flag.
+// Applied automatically unless the client sends its own extra_body.
+const MAX_REASONING_BY_MODEL = {
+  'z-ai/glm-5.2': { chat_template_kwargs: { reasoning_effort: 'max' } },
+  'deepseek-ai/deepseek-v4-pro': { chat_template_kwargs: { thinking: true, reasoning_effort: 'max' } },
+  'minimaxai/minimax-m3': { chat_template_kwargs: { thinking_mode: 'enabled' } }
 };
 
 // 1. Root Endpoint (Fixes Railway "/" 404 Error)
@@ -105,7 +118,11 @@ app.post('/v1/chat/completions', async (req, res) => {
     const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : 131072;
 
     // Handle extra_body for thinking parameters
-    const finalExtraBody = extra_body || (ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined);
+    // Priority: client-supplied extra_body > per-model max-reasoning default > global toggle
+    const finalExtraBody =
+      extra_body ||
+      MAX_REASONING_BY_MODEL[nimModel] ||
+      (ENABLE_THINKING_MODE ? { chat_template_kwargs: { thinking: true } } : undefined);
 
     // Transform OpenAI request to NVIDIA NIM format
     const nimRequest = {
