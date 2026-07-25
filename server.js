@@ -114,14 +114,18 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // Smart model selection with fallback
     let nimModel = MODEL_MAPPING[model] || model;
-    
-    // Default High Max Tokens (raised to 1,000,000 per request — note: this is our own
-    // proxy-side ceiling only. NVIDIA's hosted endpoints enforce their own real output caps
-    // per model (e.g. GLM-5.2 lists 131072 as its actual max output on NIM), so requests
-    // above a model's true limit will still be clamped or rejected upstream regardless of
-    // this value.)
+
+    // MAX_ALLOWED_TOKENS is an upper bound only (1,000,000), for clients that explicitly
+    // want to push near a model's real limit. DEFAULT_MAX_TOKENS is what's used when the
+    // client omits max_tokens entirely — kept at 131072 since that's GLM-5.2's confirmed
+    // real output cap on NVIDIA's hosted endpoint; defaulting the omitted case to 1,000,000
+    // caused NIM to silently return an empty {choices: [], usage: zeros} response instead
+    // of a clean error. Other models may have different real caps — if a specific explicit
+    // max_tokens value causes the same empty-response symptom, that model's real ceiling is
+    // lower than requested.
     const MAX_ALLOWED_TOKENS = 1000000;
-    const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : MAX_ALLOWED_TOKENS;
+    const DEFAULT_MAX_TOKENS = 131072;
+    const selectedMaxTokens = max_tokens ? Math.min(max_tokens, MAX_ALLOWED_TOKENS) : DEFAULT_MAX_TOKENS;
 
     // Determine reasoning config for this request.
     // Priority: client's own top-level chat_template_kwargs > legacy extra_body.chat_template_kwargs
