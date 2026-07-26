@@ -1,4 +1,4 @@
-// server.js - OpenAI to NVIDIA NIM API Proxy
+// server.js - OpenAI to NVIDIA NIM API Proxy (dual-key load balanced)
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
@@ -12,13 +12,162 @@ app.use(express.json({ limit: '50mb' })); // Increased payload limit for large c
 
 // NVIDIA NIM API configuration
 const NIM_API_BASE = process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1';
-const NIM_API_KEY = process.env.NIM_API_KEY;
 
 // 🔥 REASONING DISPLAY TOGGLE - Shows/hides reasoning in output with <think> tags
 const SHOW_REASONING = true; // TEMP: debugging whether reasoning_content is actually returned
 
 // 🔥 DEFAULT THINKING MODE TOGGLE (if not provided by client)
-const ENABLE_THINKING_MODE = false; 
+const ENABLE_THINKING_MODE = false;
+
+// ---------------------------------------------------------------------------
+// 🔀 DUAL-KEY LOAD BALANCER
+// ---------------------------------------------------------------------------
+// Two devs, two NVIDIA accounts, each capped at ~40 requests/minute by NVIDIA.
+// Both keys are pooled behind this one proxy and every request is routed to
+// whichever key currently has the most headroom left in a rolling 60s
+// window ("least loaded"), not blind round robin — so one slow/heavy burst
+// on key A doesn't cause key B to sit idle, and neither key gets pushed past
+// its own limit.
+//
+// If BOTH keys are momentarily maxed out, requests don't just fail — they
+// wait (checking again as old requests roll out of the 60s window) up to
+// NIM_QUEUE_TIMEOUT_MS, then return a proper 429 with Retry-After if nothing
+// freed up in time. That's the "juggle continuously without crashing"
+// behavior: smooth over short bursts, degrade gracefully under sustained
+// overload instead of hammering NVIDIA or hanging forever.
+//
+// Set these in Railway → your service → Variables:
+//   NIM_API_KEY_1          - first NVIDIA NIM API key   (required)
+//   NIM_API_KEY_2          - second NVIDIA NIM API key  (optional but this is the whole point)
+//   NIM_RPM_LIMIT_PER_KEY  - requests/minute allowed per key (default 40)
+//   NIM_QUEUE_TIMEOUT_MS   - max wait for a free slot before replying 429 (default 30000)
+//
+// Back-compat: if you still have the old single NIM_API_KEY var set and no
+// NIM_API_KEY_1, it's used automatically as key #1.
+// ---------------------------------------------------------------------------
+
+const RPM_LIMIT_PER_KEY = parseInt(process.env.NIM_RPM_LIMIT_PER_KEY || '40', 10);
+const QUEUE_TIMEOUT_MS = parseInt(process.env.NIM_QUEUE_TIMEOUT_MS || '30000', 10);
+
+const RAW_KEYS = [
+  process.env.NIM_API_KEY_1 || process.env.NIM_API_KEY,
+  process.env.NIM_API_KEY_2
+].filter(Boolean);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+class KeyPool {
+  constructor(keys, limitPerMinute) {
+    this.limit = limitPerMinute;
+    this.windowMs = 60 * 1000;
+    this.keys = keys.map((key, idx) => ({
+      id: idx + 1,
+      key,
+      label: `key_${idx + 1}`,
+      timestamps: [] // start-of-request timestamps within the trailing 60s window
+    }));
+  }
+
+  _prune(keyState, now) {
+    const cutoff = now - this.windowMs;
+    while (keyState.timestamps.length && keyState.timestamps[0] <= cutoff) {
+      keyState.timestamps.shift();
+    }
+  }
+
+  // Picks the key with the most headroom left in the current 60s window.
+  _bestOption(now) {
+    let best = null;
+    for (const keyState of this.keys) {
+      this._prune(keyState, now);
+      const used = keyState.timestamps.length;
+      const headroom = this.limit - used;
+      if (!best || headroom > best.headroom) {
+        best = { keyState, headroom, used };
+      }
+    }
+    return best;
+  }
+
+  // Reserves a slot on the least-loaded key. If every key is saturated,
+  // waits (re-checking as slots roll off the window) instead of failing
+  // immediately, up to timeoutMs. Throws RATE_LIMIT_TIMEOUT if nothing frees
+  // up in time, so a request can never hang forever.
+  async acquire(timeoutMs = QUEUE_TIMEOUT_MS) {
+    if (this.keys.length === 0) {
+      const err = new Error('No NIM API keys configured.');
+      err.code = 'NO_KEYS';
+      throw err;
+    }
+
+    const deadline = Date.now() + timeoutMs;
+
+    while (true) {
+      const now = Date.now();
+      const best = this._bestOption(now);
+
+      if (best.headroom > 0) {
+        best.keyState.timestamps.push(now);
+        return best.keyState;
+      }
+
+      if (now >= deadline) {
+        const err = new Error('All API keys are at their per-minute rate limit; timed out waiting for a free slot.');
+        err.code = 'RATE_LIMIT_TIMEOUT';
+        throw err;
+      }
+
+      // Every key is full — figure out when the oldest reservation on any
+      // key falls out of the 60s window and sleep roughly until then.
+      let earliest = Infinity;
+      for (const keyState of this.keys) {
+        this._prune(keyState, now);
+        if (keyState.timestamps.length) {
+          earliest = Math.min(earliest, keyState.timestamps[0]);
+        }
+      }
+      const rawWait = (earliest + this.windowMs) - now + 25;
+      const waitMs = Math.min(Math.max(rawWait, 50), 5000, Math.max(deadline - now, 0));
+      await sleep(waitMs);
+    }
+  }
+
+  // Called when NIM itself returns a 429 for a key we thought had headroom —
+  // meaning real usage on that key is higher than our local count (e.g.
+  // something outside this proxy is also drawing on it). Pad the window so
+  // we stop routing to it until it naturally rolls off, instead of
+  // repeatedly re-discovering the same 429.
+  markSaturated(keyState) {
+    const now = Date.now();
+    while (keyState.timestamps.length < this.limit) {
+      keyState.timestamps.push(now);
+    }
+  }
+
+  stats() {
+    const now = Date.now();
+    return this.keys.map((keyState) => {
+      this._prune(keyState, now);
+      const used = keyState.timestamps.length;
+      const oldest = keyState.timestamps[0];
+      return {
+        label: keyState.label,
+        used,
+        limit: this.limit,
+        remaining: Math.max(this.limit - used, 0),
+        resets_in_ms: oldest ? Math.max((oldest + this.windowMs) - now, 0) : 0
+      };
+    });
+  }
+}
+
+const keyPool = new KeyPool(RAW_KEYS, RPM_LIMIT_PER_KEY);
+
+if (RAW_KEYS.length === 0) {
+  console.warn('⚠️  No NIM API keys configured (NIM_API_KEY_1 / NIM_API_KEY_2). Requests will fail until set.');
+} else {
+  console.log(`✅ Loaded ${RAW_KEYS.length} NIM API key(s) · ${RPM_LIMIT_PER_KEY} req/min each · queue timeout ${QUEUE_TIMEOUT_MS}ms`);
+}
 
 // High-context Model mapping
 const MODEL_MAPPING = {
@@ -57,19 +206,31 @@ app.get('/', (req, res) => {
     endpoints: {
       health: '/health',
       models: '/v1/models',
-      chat: '/v1/chat/completions'
+      chat: '/v1/chat/completions',
+      proxy_stats: '/v1/proxy-stats'
     }
   });
 });
 
 // 2. Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'OpenAI to NVIDIA NIM Proxy', 
+  res.json({
+    status: 'ok',
+    service: 'OpenAI to NVIDIA NIM Proxy',
     reasoning_display: SHOW_REASONING,
     thinking_mode: ENABLE_THINKING_MODE,
-    api_key_configured: Boolean(NIM_API_KEY)
+    keys_configured: RAW_KEYS.length,
+    rpm_limit_per_key: RPM_LIMIT_PER_KEY,
+    key_usage: keyPool.stats()
+  });
+});
+
+// 2b. Load-balancer stats endpoint (usage per key, no key values exposed)
+app.get('/v1/proxy-stats', (req, res) => {
+  res.json({
+    rpm_limit_per_key: RPM_LIMIT_PER_KEY,
+    queue_timeout_ms: QUEUE_TIMEOUT_MS,
+    keys: keyPool.stats()
   });
 });
 
@@ -81,7 +242,7 @@ app.get('/v1/models', (req, res) => {
     created: Date.now(),
     owned_by: 'nvidia-nim-proxy'
   }));
-  
+
   res.json({
     object: 'list',
     data: models
@@ -91,23 +252,23 @@ app.get('/v1/models', (req, res) => {
 // 4. Chat completions endpoint (Main Proxy)
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { 
-      model, 
-      messages, 
-      temperature, 
-      top_p, 
-      max_tokens, 
-      stream, 
+    const {
+      model,
+      messages,
+      temperature,
+      top_p,
+      max_tokens,
+      stream,
       extra_body,       // legacy/back-compat: some SDKs nest reasoning config here
       chat_template_kwargs, // NIM's actual native field — sent directly by well-behaved clients
       seed,
       ...rest           // pass through anything else the client sends (tools, response_format, etc.)
     } = req.body;
 
-    if (!NIM_API_KEY) {
+    if (keyPool.keys.length === 0) {
       return res.status(500).json({
         error: {
-          message: 'NIM_API_KEY is not set in Railway environment variables.',
+          message: 'No NIM API key configured. Set NIM_API_KEY_1 (and optionally NIM_API_KEY_2) in Railway environment variables.',
           type: 'configuration_error',
           code: 500
         }
@@ -163,14 +324,62 @@ app.post('/v1/chat/completions', async (req, res) => {
       nimRequest.chat_template_kwargs = finalChatTemplateKwargs;
     }
 
-    // Make request to NVIDIA NIM API
-    const response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
-      headers: {
-        'Authorization': `Bearer ${NIM_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      responseType: stream ? 'stream' : 'json'
-    });
+    // 🔀 Acquire the least-loaded key and make the request. If a key comes
+    // back 429/5xx, mark it and retry on the other key (bounded by how many
+    // keys are configured) before giving up. Non-retryable errors (bad
+    // request, auth, etc.) bubble straight out.
+    const attempts = Math.max(keyPool.keys.length, 1);
+    let response;
+    let lastError;
+
+    for (let i = 0; i < attempts; i++) {
+      let keyState;
+      try {
+        keyState = await keyPool.acquire();
+      } catch (acquireErr) {
+        if (acquireErr.code === 'RATE_LIMIT_TIMEOUT') {
+          res.setHeader('Retry-After', '5');
+          return res.status(429).json({
+            error: {
+              message: acquireErr.message,
+              type: 'rate_limit_error',
+              code: 429
+            }
+          });
+        }
+        throw acquireErr;
+      }
+
+      try {
+        response = await axios.post(`${NIM_API_BASE}/chat/completions`, nimRequest, {
+          headers: {
+            'Authorization': `Bearer ${keyState.key}`,
+            'Content-Type': 'application/json'
+          },
+          responseType: stream ? 'stream' : 'json'
+        });
+        lastError = null;
+        break; // success — stop trying further keys
+      } catch (error) {
+        lastError = error;
+        const status = error.response?.status;
+
+        if (status === 429) {
+          console.warn(`⚠️  ${keyState.label} returned 429 from NIM — marking saturated, trying next key if available.`);
+          keyPool.markSaturated(keyState);
+          continue;
+        }
+        if (status >= 500 && status < 600) {
+          console.warn(`⚠️  ${keyState.label} returned ${status} from NIM — trying next key if available.`);
+          continue;
+        }
+        throw error; // not retryable — handled by outer catch below
+      }
+    }
+
+    if (!response) {
+      throw lastError || new Error('All configured NIM API keys failed.');
+    }
 
     if (stream) {
       // Handle streaming response with reasoning option
