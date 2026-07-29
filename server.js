@@ -20,39 +20,62 @@ const SHOW_REASONING = true; // TEMP: debugging whether reasoning_content is act
 const ENABLE_THINKING_MODE = false;
 
 // ---------------------------------------------------------------------------
-// 🔀 DUAL-KEY LOAD BALANCER
+// 🔀 MULTI-KEY LOAD BALANCER
 // ---------------------------------------------------------------------------
-// Two devs, two NVIDIA accounts, each capped at ~40 requests/minute by NVIDIA.
-// Both keys are pooled behind this one proxy and every request is routed to
+// Any number of devs/accounts, each capped at ~40 requests/minute by NVIDIA.
+// All keys are pooled behind this one proxy and every request is routed to
 // whichever key currently has the most headroom left in a rolling 60s
 // window ("least loaded"), not blind round robin — so one slow/heavy burst
-// on key A doesn't cause key B to sit idle, and neither key gets pushed past
-// its own limit.
+// on one key doesn't leave the others idle, and none of them gets pushed
+// past its own limit.
 //
-// If BOTH keys are momentarily maxed out, requests don't just fail — they
+// If ALL keys are momentarily maxed out, requests don't just fail — they
 // wait (checking again as old requests roll out of the 60s window) up to
 // NIM_QUEUE_TIMEOUT_MS, then return a proper 429 with Retry-After if nothing
 // freed up in time. That's the "juggle continuously without crashing"
 // behavior: smooth over short bursts, degrade gracefully under sustained
 // overload instead of hammering NVIDIA or hanging forever.
 //
-// Set these in Railway → your service → Variables:
-//   NIM_API_KEY_1          - first NVIDIA NIM API key   (required)
-//   NIM_API_KEY_2          - second NVIDIA NIM API key  (optional but this is the whole point)
+// Set these in Railway → your service → Variables. Add one indexed variable
+// per key — any count works, just keep numbering sequentially:
+//   NIM_API_KEY_1          - first key  (required)
+//   NIM_API_KEY_2          - second key
+//   NIM_API_KEY_3          - third key, and so on as more people join
 //   NIM_RPM_LIMIT_PER_KEY  - requests/minute allowed per key (default 40)
 //   NIM_QUEUE_TIMEOUT_MS   - max wait for a free slot before replying 429 (default 30000)
 //
-// Back-compat: if you still have the old single NIM_API_KEY var set and no
-// NIM_API_KEY_1, it's used automatically as key #1.
+// Back-compat: if you still have the old single NIM_API_KEY var and no
+// NIM_API_KEY_1/2/3..., it's used automatically as the only key.
 // ---------------------------------------------------------------------------
 
 const RPM_LIMIT_PER_KEY = parseInt(process.env.NIM_RPM_LIMIT_PER_KEY || '40', 10);
 const QUEUE_TIMEOUT_MS = parseInt(process.env.NIM_QUEUE_TIMEOUT_MS || '30000', 10);
 
-const RAW_KEYS = [
-  process.env.NIM_API_KEY_1 || process.env.NIM_API_KEY,
-  process.env.NIM_API_KEY_2
-].filter(Boolean);
+// Scans for NIM_API_KEY_1, NIM_API_KEY_2, NIM_API_KEY_3, ... (any count, any
+// order) so adding another dev's key is just "add a Railway variable" —
+// no code changes needed. Also accepts the old single NIM_API_KEY var, and
+// an optional comma-separated NIM_API_KEYS for convenience.
+function loadApiKeys() {
+  const keys = [];
+
+  const indexed = Object.keys(process.env)
+    .filter((k) => /^NIM_API_KEY_\d+$/.test(k))
+    .sort((a, b) => parseInt(a.split('_').pop(), 10) - parseInt(b.split('_').pop(), 10))
+    .map((k) => process.env[k]);
+  keys.push(...indexed);
+
+  if (process.env.NIM_API_KEYS) {
+    keys.push(...process.env.NIM_API_KEYS.split(',').map((s) => s.trim()));
+  }
+
+  if (indexed.length === 0 && process.env.NIM_API_KEY) {
+    keys.push(process.env.NIM_API_KEY); // back-compat, single-key era
+  }
+
+  return [...new Set(keys.filter(Boolean))];
+}
+
+const RAW_KEYS = loadApiKeys();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -164,7 +187,7 @@ class KeyPool {
 const keyPool = new KeyPool(RAW_KEYS, RPM_LIMIT_PER_KEY);
 
 if (RAW_KEYS.length === 0) {
-  console.warn('⚠️  No NIM API keys configured (NIM_API_KEY_1 / NIM_API_KEY_2). Requests will fail until set.');
+  console.warn('⚠️  No NIM API keys configured (set NIM_API_KEY_1, NIM_API_KEY_2, ... in Railway). Requests will fail until set.');
 } else {
   console.log(`✅ Loaded ${RAW_KEYS.length} NIM API key(s) · ${RPM_LIMIT_PER_KEY} req/min each · queue timeout ${QUEUE_TIMEOUT_MS}ms`);
 }
@@ -268,7 +291,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (keyPool.keys.length === 0) {
       return res.status(500).json({
         error: {
-          message: 'No NIM API key configured. Set NIM_API_KEY_1 (and optionally NIM_API_KEY_2) in Railway environment variables.',
+          message: 'No NIM API key configured. Set NIM_API_KEY_1 (and NIM_API_KEY_2, NIM_API_KEY_3, ... for more) in Railway environment variables.',
           type: 'configuration_error',
           code: 500
         }
