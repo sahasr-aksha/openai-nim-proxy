@@ -3,6 +3,17 @@ const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
 
+// Safety net: log instead of letting the whole process die on an unexpected
+// throw/rejection somewhere in the codebase (e.g. a future serialization bug).
+// The real fix for known cases should still happen at the source — this is
+// just a backstop so one bad request can't take down every other request.
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -512,16 +523,28 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
   } catch (error) {
-    console.error('Proxy error:', error.response?.data || error.message);
+    // When responseType was 'stream' (client sent stream: true), axios puts
+    // the raw Node HTTP stream on error.response.data instead of parsed
+    // JSON. That object is circular (socket -> parser -> incoming -> ...),
+    // so it must NEVER be handed to res.json()/JSON.stringify — doing so
+    // throws "Converting circular structure to JSON", which (since this is
+    // inside an async handler with no outer .catch) becomes an unhandled
+    // rejection and kills the whole process, not just this one request.
+    const rawData = error.response?.data;
+    const isStream = rawData && typeof rawData.pipe === 'function';
+
+    console.error('Proxy error:', isStream ? error.message : (rawData || error.message));
 
     const statusCode = error.response?.status || 500;
-    const errorDetails = error.response?.data?.error || error.response?.data || {
+    const errorDetails = (!isStream && (rawData?.error || rawData)) || {
       message: error.message || 'Internal server error',
       type: 'proxy_error',
       code: statusCode
     };
 
-    res.status(statusCode).json({ error: errorDetails });
+    if (!res.headersSent) {
+      res.status(statusCode).json({ error: errorDetails });
+    }
   }
 });
 
